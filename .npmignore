@@ -1,0 +1,22 @@
+# Development files
+test/
+*.md
+.env*
+!.env.example
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
