@@ -242,6 +242,7 @@ async function subscribeStockFromServer(
 
           // Update stock price in database
           const stock = await Stock.findOne({ code: payload.symbol });
+          console.log("🚀 => stock:", stock)
           if (stock && payload.close) {
             stock.marketPrice = payload.close * 1000;
             stock.highPrice = payload.high * 1000;
