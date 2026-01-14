@@ -1,12 +1,11 @@
 {
   "name": "mqtt-wss-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Standalone WebSocket server for MQTT stock price subscriptions",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js",
-    "test": "node test/test-server.js"
+    "dev": "nodemon src/index.js"
   },
   "keywords": [
     "mqtt",

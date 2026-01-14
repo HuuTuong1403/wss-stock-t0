@@ -322,6 +322,25 @@ Send a WebSocket message:
 | `BROKER_PORT` | `443` | MQTT broker port |
 | `DEBUG` | `false` | Enable debug logging |
 | `NODE_ENV` | `development` | Environment mode |
+| `DNSE_USERNAME` | - | DNSE username for auto-refresh (optional) |
+| `DNSE_PASSWORD` | - | DNSE password for auto-refresh (optional) |
+| `TARGET_USER_ID` | `6965f14d5ad4273f2010d5a4` | User ID to update when token refreshed |
+
+### Auto-Refresh & Auto-Retry Feature 🔄
+
+When `DNSE_USERNAME` and `DNSE_PASSWORD` are configured, the server automatically:
+1. Detects "Bad User Name or Password" errors
+2. Calls DNSE auth API to get new token
+3. Updates the user in MongoDB with new credentials
+4. **Automatically retries the subscription with new token**
+5. Client receives data seamlessly - no manual retry needed!
+
+**Client benefits:**
+- ✅ No need to handle token refresh manually
+- ✅ No need to retry subscription
+- ✅ Seamless experience - just receive data!
+
+See [AUTO_RETRY_FLOW.md](./AUTO_RETRY_FLOW.md) for detailed flow explanation.
 
 ## Troubleshooting
 

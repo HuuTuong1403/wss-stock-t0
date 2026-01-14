@@ -14,6 +14,11 @@ const BROKER_PORT = parseInt(process.env.BROKER_PORT || "443");
 const CLIENT_ID_PREFIX = "dnse-price-json-mqtt-ws-sub-";
 const DEBUG = process.env.DEBUG === "true";
 
+// DNSE Auto-refresh credentials
+const DNSE_USERNAME = process.env.DNSE_USERNAME;
+const DNSE_PASSWORD = process.env.DNSE_PASSWORD;
+const TARGET_USER_ID = process.env.TARGET_USER_ID || "";
+
 // Store active MQTT clients by WebSocket connection
 const mqttClients = new WeakMap();
 
@@ -34,6 +39,10 @@ const stockSchema = new mongoose.Schema({
   code: { type: String, required: true, unique: true },
   name: { type: String, required: true },
   marketPrice: { type: Number, default: 0 },
+  highPrice: { type: Number, default: 0 },
+  lowPrice: { type: Number, default: 0 },
+  openPrice: { type: Number, default: 0 },
+  volumn: { type: Number, default: 0 },
   industry: { type: String, required: true },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
@@ -50,6 +59,76 @@ const userSchema = new mongoose.Schema({
 
 const User = mongoose.models.User || mongoose.model("User", userSchema);
 
+/**
+ * Auto-refresh DNSE token when authentication fails
+ */
+async function refreshDNSEToken() {
+  if (!DNSE_USERNAME || !DNSE_PASSWORD) {
+    console.error("❌ DNSE credentials not configured in environment");
+    return null;
+  }
+
+  try {
+    console.log("🔄 Refreshing DNSE token...");
+
+    const response = await fetch(
+      "https://api.dnse.com.vn/user-service/api/auth",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          username: DNSE_USERNAME,
+          password: DNSE_PASSWORD,
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`❌ DNSE auth failed: ${response.status} - ${errorText}`);
+      return null;
+    }
+
+    const data = await response.json();
+
+    if (!data.token) {
+      console.error("❌ Invalid response from DNSE auth API:", data);
+      return null;
+    }
+
+    console.log("✅ Successfully obtained new DNSE token");
+
+    // Update user in database
+    try {
+      const user = await User.findByIdAndUpdate(
+        TARGET_USER_ID,
+        {
+          investorToken: data.token,
+        },
+        { new: true }
+      );
+
+      if (user) {
+        console.log(`✅ Updated user ${TARGET_USER_ID} with new token`);
+      } else {
+        console.warn(`⚠️ User ${TARGET_USER_ID} not found in database`);
+      }
+    } catch (dbError) {
+      console.error("❌ Error updating user in database:", dbError);
+    }
+
+    return {
+      investorToken: data.token,
+      investorId: data.investorId,
+    };
+  } catch (error) {
+    console.error("❌ Error refreshing DNSE token:", error.message);
+    return null;
+  }
+}
+
 // Create WebSocket server
 const wss = new WebSocket.Server({ port: WSS_PORT });
 
@@ -57,16 +136,29 @@ console.log(`🚀 WebSocket server started on port ${WSS_PORT}`);
 console.log(`🌐 Connect to: ws://localhost:${WSS_PORT}`);
 console.log(`📡 MQTT Broker: ${BROKER_HOST}:${BROKER_PORT}`);
 console.log(`🐛 Debug mode: ${DEBUG ? "ON" : "OFF"}`);
+console.log(
+  `🔄 Auto-refresh: ${DNSE_USERNAME && DNSE_PASSWORD ? "ENABLED" : "DISABLED"}`
+);
+if (DNSE_USERNAME && DNSE_PASSWORD) {
+  console.log(`👤 Target User ID: ${TARGET_USER_ID}`);
+}
 
 /**
  * Subscribe to stock from MQTT and forward to WebSocket client
+ * @param {WebSocket} ws - WebSocket connection
+ * @param {string} code - Stock code
+ * @param {string} investorToken - DNSE investor token
+ * @param {string} investorId - DNSE investor ID
+ * @param {string} userId - MongoDB user ID
+ * @param {number} retryCount - Retry counter to prevent infinite loops (max 1 retry)
  */
 async function subscribeStockFromServer(
   ws,
   code,
   investorToken,
   investorId,
-  userId
+  userId,
+  retryCount = 0
 ) {
   const clientId = `${CLIENT_ID_PREFIX}${randomInt(1000, 2000)}`;
   const topic = `plaintext/quotes/krx/mdds/v2/ohlc/stock/1D/${code}`;
@@ -152,6 +244,10 @@ async function subscribeStockFromServer(
           const stock = await Stock.findOne({ code: payload.symbol });
           if (stock && payload.close) {
             stock.marketPrice = payload.close * 1000;
+            stock.highPrice = payload.high * 1000;
+            stock.lowPrice = payload.low * 1000;
+            stock.openPrice = payload.open * 1000;
+            stock.volumn = payload.volume;
             stock.updatedAt = new Date();
             await stock.save();
             console.log(`💾 Updated ${code} price: ${payload.close * 1000}`);
@@ -165,6 +261,10 @@ async function subscribeStockFromServer(
               symbol: payload.symbol,
               close: payload.close,
               marketPrice: payload.close * 1000,
+              highPrice: payload.high * 1000,
+              lowPrice: payload.low * 1000,
+              openPrice: payload.open * 1000,
+              volumn: payload.volume,
               timestamp: new Date().toISOString(),
             },
           });
@@ -193,13 +293,75 @@ async function subscribeStockFromServer(
         errorMessage.includes("Not authorized") ||
         errorMessage.includes("Authentication failed")
       ) {
-        console.log(`🔄 Token expired for ${code}, notifying client...`);
+        console.log(`🔄 Token expired for ${code}, attempting auto-refresh...`);
 
-        sendMessage(ws, {
-          type: "auth_error",
-          code,
-          error: "Authentication failed. Token refresh needed.",
-        });
+        // Prevent infinite retry loop
+        if (retryCount >= 1) {
+          console.error(`❌ Max retry attempts reached for ${code}`);
+          sendMessage(ws, {
+            type: "auth_error",
+            code,
+            error: "Authentication failed after token refresh attempt.",
+          });
+          clearTimeout(timeout);
+          client.end();
+          return;
+        }
+
+        // Try to refresh token automatically
+        const newCredentials = await refreshDNSEToken();
+
+        if (newCredentials) {
+          console.log(`✅ Token refreshed successfully for ${code}`);
+          console.log(`🔄 Auto-retrying subscription for ${code}...`);
+
+          // Notify client about token refresh
+          sendMessage(ws, {
+            type: "token_refreshed",
+            code,
+            message: "Token refreshed automatically. Retrying subscription...",
+            newCredentials: {
+              investorToken: newCredentials.investorToken,
+              investorId: newCredentials.investorId,
+            },
+          });
+
+          // Clean up current connection
+          clearTimeout(timeout);
+          client.end();
+
+          // Auto-retry subscription with new credentials
+          try {
+            await subscribeStockFromServer(
+              ws,
+              code,
+              newCredentials.investorToken,
+              newCredentials.investorId,
+              userId,
+              retryCount + 1 // Increment retry counter
+            );
+          } catch (retryError) {
+            console.error(
+              `❌ Retry subscription failed for ${code}:`,
+              retryError
+            );
+            sendMessage(ws, {
+              type: "error",
+              code,
+              error: "Retry subscription failed after token refresh.",
+            });
+          }
+
+          return;
+        } else {
+          console.error(`❌ Failed to refresh token for ${code}`);
+
+          sendMessage(ws, {
+            type: "auth_error",
+            code,
+            error: "Authentication failed and token refresh failed.",
+          });
+        }
 
         clearTimeout(timeout);
         client.end();
